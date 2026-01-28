@@ -5,18 +5,29 @@ Run YOLOv5 detection on camera images (cam08xxx.jpg or cam_08xxx.jpg) from direc
 Usage:
     $ python detect_cam.py --weights yolov5s.pt --source paths.txt --path-prefix /data/images --output-format json
 
+    # With visualization (saves annotated images to separate directory)
+    $ python detect_cam.py --source paths.txt --save-viz --viz-dir runs/detect_cam
+
+    # Test mode (uses sample images for validation)
+    $ python detect_cam.py --test-mode --save-viz --viz-dir runs/test_viz
+
 Arguments:
     --source: txt file where each line is a directory path containing images
     --path-prefix: prefix to add to relative paths in the source txt file
     --output-format: 'txt' or 'json' for saving detection results
     --cam-pattern: regex pattern to match camera image names (default matches cam08xxx.jpg or cam_08xxx.jpg)
+    --save-viz: save visualization images with bounding boxes
+    --viz-dir: directory to save visualization images (avoids modifying original data)
+    --test-mode: run in test mode using sample images
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -27,6 +38,8 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
+from ultralytics.utils.plotting import Annotator, colors
+
 from models.common import DetectMultiBackend
 from utils.augmentations import letterbox
 from utils.dataloaders import IMG_FORMATS
@@ -36,6 +49,7 @@ from utils.general import (
     check_img_size,
     check_requirements,
     cv2,
+    increment_path,
     non_max_suppression,
     print_args,
     scale_boxes,
@@ -138,6 +152,41 @@ def save_detections_json(detections, output_path, names, image_name):
         json.dump(result, f, indent=2)
 
 
+def setup_test_mode():
+    """
+    Setup test mode by creating a temporary directory with sample images.
+    Uses existing sample images from data/images directory.
+
+    Returns:
+        tuple: (test_dir, paths_file) - temporary directory and paths.txt file for testing
+    """
+    test_dir = tempfile.mkdtemp(prefix="detect_cam_test_")
+    test_subdir = os.path.join(test_dir, "test_images")
+    os.makedirs(test_subdir, exist_ok=True)
+
+    # Copy sample images with cam pattern names
+    sample_images = [
+        ROOT / "data/images/bus.jpg",
+        ROOT / "data/images/zidane.jpg",
+    ]
+
+    cam_names = ["cam08001.jpg", "cam_08002.jpg"]
+
+    for src, cam_name in zip(sample_images, cam_names):
+        src_path = Path(src).resolve()
+        if src_path.exists():
+            dst = os.path.join(test_subdir, cam_name)
+            shutil.copy(str(src_path), dst)
+            LOGGER.info(f"Test mode: copied {src_path.name} -> {cam_name}")
+
+    # Create paths.txt
+    paths_file = os.path.join(test_dir, "paths.txt")
+    with open(paths_file, "w") as f:
+        f.write(test_subdir + "\n")
+
+    return test_dir, paths_file
+
+
 @smart_inference_mode()
 def run(
     weights=ROOT / "yolov5s.pt",  # model path
@@ -156,6 +205,10 @@ def run(
     augment=False,  # augmented inference
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
+    save_viz=False,  # save visualization images
+    viz_dir=ROOT / "runs/detect_cam",  # directory for visualization output
+    test_mode=False,  # run in test mode with sample images
+    line_thickness=3,  # bounding box line thickness
 ):
     """
     Run YOLOv5 detection on camera images from directories listed in a txt file.
@@ -177,8 +230,27 @@ def run(
         augment: Augmented inference
         half: FP16 half-precision inference
         dnn: Use OpenCV DNN for ONNX inference
+        save_viz: Save visualization images with bounding boxes
+        viz_dir: Directory to save visualization images (avoids modifying original data)
+        test_mode: Run in test mode using sample images
+        line_thickness: Bounding box line thickness for visualization
     """
+    test_cleanup_dir = None
+
+    # Handle test mode
+    if test_mode:
+        LOGGER.info("Running in TEST MODE - using sample images")
+        test_cleanup_dir, source = setup_test_mode()
+        LOGGER.info(f"Test mode: created temporary directory {test_cleanup_dir}")
+
     source = str(source)
+
+    # Setup visualization directory
+    viz_save_dir = None
+    if save_viz:
+        viz_save_dir = increment_path(Path(viz_dir), exist_ok=False)
+        viz_save_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info(f"Visualization images will be saved to: {viz_save_dir}")
 
     # Read directory paths from source txt file
     if not os.path.isfile(source):
@@ -237,6 +309,9 @@ def run(
             seen += 1
             detections = []
 
+            # Create annotator for visualization
+            annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -244,7 +319,13 @@ def run(
                 for *xyxy, conf, cls in det:
                     detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), int(cls)])
 
-            # Save results to original directory
+                    # Add box to visualization
+                    if save_viz and annotator is not None:
+                        c = int(cls)
+                        label = f"{names[c]} {conf:.2f}"
+                        annotator.box_label(xyxy, label, color=colors(c, True))
+
+            # Save results to original directory (or test directory in test mode)
             img_name = Path(img_path).stem
             if output_format == "json":
                 output_path = os.path.join(output_dir, f"{img_name}_det.json")
@@ -253,13 +334,28 @@ def run(
                 output_path = os.path.join(output_dir, f"{img_name}_det.txt")
                 save_detections_txt(detections, output_path, names)
 
-            n_det = len(detections)
-            LOGGER.info(f"{img_path}: {n_det} detection{'s' * (n_det != 1)} -> {output_path}")
+            # Save visualization image (to separate directory to avoid modifying original)
+            if save_viz and annotator is not None:
+                viz_img = annotator.result()
+                viz_path = str(viz_save_dir / f"{img_name}_viz.jpg")
+                cv2.imwrite(viz_path, viz_img)
+                LOGGER.info(f"{img_path}: {len(detections)} detection(s) -> {output_path}, viz: {viz_path}")
+            else:
+                n_det = len(detections)
+                LOGGER.info(f"{img_path}: {n_det} detection{'s' * (n_det != 1)} -> {output_path}")
 
     # Print results
     t = tuple(x.t / seen * 1e3 if seen else 0 for x in dt)  # speeds per image
     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
-    LOGGER.info(f"Results saved to original directories. Processed {seen} images.")
+
+    if save_viz:
+        LOGGER.info(f"Detection results saved. Visualizations saved to: {viz_save_dir}")
+    else:
+        LOGGER.info(f"Results saved to original directories. Processed {seen} images.")
+
+    # Cleanup test mode temporary directory
+    if test_cleanup_dir and os.path.exists(test_cleanup_dir):
+        LOGGER.info(f"Test mode: keeping temporary directory for inspection: {test_cleanup_dir}")
 
 
 def parse_opt():
@@ -288,6 +384,13 @@ def parse_opt():
     parser.add_argument("--augment", action="store_true", help="augmented inference")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+    # Visualization and test mode options
+    parser.add_argument("--save-viz", action="store_true", help="save visualization images with bounding boxes")
+    parser.add_argument(
+        "--viz-dir", type=str, default=ROOT / "runs/detect_cam", help="directory for visualization output"
+    )
+    parser.add_argument("--test-mode", action="store_true", help="run in test mode with sample images")
+    parser.add_argument("--line-thickness", type=int, default=3, help="bounding box line thickness for visualization")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
