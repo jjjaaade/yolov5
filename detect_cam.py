@@ -1,11 +1,17 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-Run YOLOv5 detection on camera images (cam08xxx.jpg or cam_08xxx.jpg) from directories listed in a txt file.
+Run YOLOv5 detection on camera images from directories listed in a txt file.
+
+Supports multiple camera IDs (05, 06, 07, 08, 09) with naming format:
+- camera{cam_id}xxx.jpg or camera_{cam_id}xxx.jpg
 
 Usage:
-    $ python detect_cam.py --weights yolov5s.pt --source paths.txt --path-prefix /data/images --output-format json
+    $ python detect_cam.py --weights yolov5s.pt --source paths.txt --path-prefix /data/images
 
-    # With visualization (saves annotated images to separate directory)
+    # Save both JSON and TXT results
+    $ python detect_cam.py --source paths.txt --output-format both
+
+    # With visualization (saves annotated images organized by folder name/timestamp)
     $ python detect_cam.py --source paths.txt --save-viz --viz-dir runs/detect_cam
 
     # Test mode (uses sample images for validation)
@@ -14,10 +20,10 @@ Usage:
 Arguments:
     --source: txt file where each line is a directory path containing images
     --path-prefix: prefix to add to relative paths in the source txt file
-    --output-format: 'txt' or 'json' for saving detection results
-    --cam-pattern: regex pattern to match camera image names (default matches cam08xxx.jpg or cam_08xxx.jpg)
+    --output-format: 'txt', 'json', or 'both' for saving detection results
+    --cam-pattern: regex pattern to match camera image names (default matches camera05-09xxx.jpg)
     --save-viz: save visualization images with bounding boxes
-    --viz-dir: directory to save visualization images (avoids modifying original data)
+    --viz-dir: directory to save visualization images (organized by folder name)
     --test-mode: run in test mode using sample images
 """
 
@@ -57,19 +63,19 @@ from utils.general import (
 from utils.torch_utils import select_device, smart_inference_mode
 
 
-def get_cam_images(directories, path_prefix="", cam_pattern=r"cam_?08.*\.jpg"):
+def get_cam_images(directories, path_prefix="", cam_pattern=r"camera_?(0[5-9]).*\.jpg"):
     """
-    Get camera image paths from directories.
+    Get camera image paths from directories, grouped by directory.
 
     Args:
         directories: list of directory paths
         path_prefix: prefix to add to relative paths
-        cam_pattern: regex pattern to match camera image filenames
+        cam_pattern: regex pattern to match camera image filenames (must have a group for cam_id)
 
     Returns:
-        list of (image_path, output_dir) tuples where output_dir is the original directory
+        dict: {dir_path: [(image_path, cam_id), ...]} grouped by directory
     """
-    images = []
+    dir_images = {}
     pattern = re.compile(cam_pattern, re.IGNORECASE)
 
     for dir_path in directories:
@@ -92,15 +98,22 @@ def get_cam_images(directories, path_prefix="", cam_pattern=r"cam_?08.*\.jpg"):
             continue
 
         # Find matching images in this directory
-        for file_path in dir_path.iterdir():
+        images = []
+        for file_path in sorted(dir_path.iterdir()):
             if file_path.is_file():
                 # Check if file matches the camera pattern
-                if pattern.match(file_path.name):
+                match = pattern.match(file_path.name)
+                if match:
                     # Check if it's a valid image format
                     if file_path.suffix[1:].lower() in IMG_FORMATS:
-                        images.append((str(file_path), str(dir_path)))
+                        # Extract cam_id from the match group
+                        cam_id = match.group(1) if match.groups() else "unknown"
+                        images.append((str(file_path), cam_id))
 
-    return images
+        if images:
+            dir_images[str(dir_path)] = images
+
+    return dir_images
 
 
 def save_detections_txt(detections, output_path, names):
@@ -152,10 +165,69 @@ def save_detections_json(detections, output_path, names, image_name):
         json.dump(result, f, indent=2)
 
 
+def save_grouped_detections_txt(grouped_detections, output_path, names):
+    """
+    Save grouped detections to txt file, organized by cam_id.
+
+    Args:
+        grouped_detections: dict {cam_id: {"image": str, "detections": list}}
+        output_path: path to save txt file
+        names: dict mapping class ids to class names
+    """
+    with open(output_path, "w") as f:
+        for cam_id in sorted(grouped_detections.keys()):
+            data = grouped_detections[cam_id]
+            f.write(f"# cam_id: {cam_id}\n")
+            f.write(f"# image: {data['image']}\n")
+            for det in data["detections"]:
+                x1, y1, x2, y2, conf, cls = det
+                cls_id = int(cls)
+                cls_name = names[cls_id] if cls_id in names else str(cls_id)
+                f.write(f"{x1:.1f} {y1:.1f} {x2:.1f} {y2:.1f} {conf:.4f} {cls_id} {cls_name}\n")
+            f.write("\n")
+
+
+def save_grouped_detections_json(grouped_detections, output_path, names):
+    """
+    Save grouped detections to json file, organized by cam_id.
+
+    Args:
+        grouped_detections: dict {cam_id: {"image": str, "detections": list}}
+        output_path: path to save json file
+        names: dict mapping class ids to class names
+    """
+    result = {}
+
+    for cam_id, data in grouped_detections.items():
+        cam_result = {
+            "image": data["image"],
+            "detections": [],
+        }
+
+        for det in data["detections"]:
+            x1, y1, x2, y2, conf, cls = det
+            cls_id = int(cls)
+            cls_name = names[cls_id] if cls_id in names else str(cls_id)
+            cam_result["detections"].append(
+                {
+                    "bbox": {"x1": round(x1, 1), "y1": round(y1, 1), "x2": round(x2, 1), "y2": round(y2, 1)},
+                    "confidence": round(float(conf), 4),
+                    "class_id": cls_id,
+                    "class_name": cls_name,
+                }
+            )
+
+        result[cam_id] = cam_result
+
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)
+
+
 def setup_test_mode():
     """
     Setup test mode by creating a temporary directory with sample images.
     Uses existing sample images from data/images directory.
+    Creates a folder structure simulating timestamp-based organization.
 
     Returns:
         tuple: (test_dir, paths_file) - temporary directory and paths.txt file for testing
@@ -164,16 +236,18 @@ def setup_test_mode():
         FileNotFoundError: If no sample images are found
     """
     test_dir = tempfile.mkdtemp(prefix="detect_cam_test_")
-    test_subdir = os.path.join(test_dir, "test_images")
+    # Use a timestamp-like folder name to test folder-based visualization organization
+    test_subdir = os.path.join(test_dir, "20240101_120000")
     os.makedirs(test_subdir, exist_ok=True)
 
-    # Copy sample images with cam pattern names (both with underscore for consistency)
+    # Copy sample images with new camera naming format (camera{cam_id}xxx.jpg)
     sample_images = [
         ROOT / "data/images/bus.jpg",
         ROOT / "data/images/zidane.jpg",
     ]
 
-    cam_names = ["cam_08001.jpg", "cam_08002.jpg"]
+    # Use camera naming format with different cam_ids (05-09)
+    cam_names = ["camera_05001.jpg", "camera_08001.jpg"]
 
     copied_count = 0
     for src, cam_name in zip(sample_images, cam_names):
@@ -207,8 +281,8 @@ def run(
     source=ROOT / "paths.txt",  # txt file with directory paths
     data=ROOT / "data/coco128.yaml",  # dataset.yaml path
     path_prefix="",  # prefix for relative paths
-    cam_pattern=r"cam_?08.*\.jpg",  # camera image pattern
-    output_format="json",  # output format: 'txt' or 'json'
+    cam_pattern=r"camera_?(0[5-9]).*\.jpg",  # camera image pattern with cam_id group
+    output_format="json",  # output format: 'txt', 'json', or 'both'
     imgsz=(640, 640),  # inference size (height, width)
     conf_thres=0.25,  # confidence threshold
     iou_thres=0.45,  # NMS IOU threshold
@@ -232,8 +306,8 @@ def run(
         source: Path to txt file containing directory paths (one per line)
         data: Path to dataset yaml file
         path_prefix: Prefix to add to relative paths in source file
-        cam_pattern: Regex pattern to match camera image filenames
-        output_format: Format for saving results ('txt' or 'json')
+        cam_pattern: Regex pattern to match camera image filenames (must include group for cam_id)
+        output_format: Format for saving results ('txt', 'json', or 'both')
         imgsz: Inference image size (height, width)
         conf_thres: Confidence threshold for detections
         iou_thres: IOU threshold for NMS
@@ -244,8 +318,8 @@ def run(
         augment: Augmented inference
         half: FP16 half-precision inference
         dnn: Use OpenCV DNN for ONNX inference
-        save_viz: Save visualization images with bounding boxes
-        viz_dir: Directory to save visualization images (avoids modifying original data)
+        save_viz: Save visualization images with bounding boxes (organized by folder name)
+        viz_dir: Directory to save visualization images
         test_mode: Run in test mode using sample images
         line_thickness: Bounding box line thickness for visualization
     """
@@ -273,13 +347,14 @@ def run(
     with open(source, "r") as f:
         directories = f.readlines()
 
-    # Get camera images
-    cam_images = get_cam_images(directories, path_prefix, cam_pattern)
-    if not cam_images:
+    # Get camera images grouped by directory
+    dir_images = get_cam_images(directories, path_prefix, cam_pattern)
+    if not dir_images:
         LOGGER.warning(f"No camera images found matching pattern '{cam_pattern}' in directories from {source}")
         return
 
-    LOGGER.info(f"Found {len(cam_images)} camera images to process")
+    total_images = sum(len(images) for images in dir_images.values())
+    LOGGER.info(f"Found {total_images} camera images in {len(dir_images)} directories to process")
 
     # Load model
     device = select_device(device)
@@ -293,77 +368,98 @@ def run(
     seen = 0
     dt = (Profile(device=device), Profile(device=device), Profile(device=device))
 
-    for img_path, output_dir in cam_images:
-        # Load image
-        im0 = cv2.imread(img_path)
-        if im0 is None:
-            LOGGER.warning(f"Image not found or cannot be read: {img_path}")
-            continue
+    # Process each directory
+    for dir_path, images in dir_images.items():
+        folder_name = Path(dir_path).name  # Use folder name (timestamp) for organization
+        grouped_detections = {}  # {cam_id: {"image": str, "detections": list}}
 
-        # Preprocess
-        with dt[0]:
-            im = letterbox(im0, imgsz, stride=stride, auto=pt)[0]
-            im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-            im = im.astype("float32") / 255.0  # 0-255 to 0.0-1.0
-            im = torch.from_numpy(im).to(model.device)
-            im = im.half() if model.fp16 else im.float()
-            if len(im.shape) == 3:
-                im = im[None]  # expand for batch dim
+        # Create visualization subdirectory for this folder if needed
+        viz_folder_dir = None
+        if save_viz:
+            viz_folder_dir = viz_save_dir / folder_name
+            viz_folder_dir.mkdir(parents=True, exist_ok=True)
 
-        # Inference
-        with dt[1]:
-            pred = model(im, augment=augment)
+        # Process each image in this directory
+        for img_path, cam_id in images:
+            # Load image
+            im0 = cv2.imread(img_path)
+            if im0 is None:
+                LOGGER.warning(f"Image not found or cannot be read: {img_path}")
+                continue
 
-        # NMS
-        with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            # Preprocess
+            with dt[0]:
+                im = letterbox(im0, imgsz, stride=stride, auto=pt)[0]
+                im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                im = im.astype("float32") / 255.0  # 0-255 to 0.0-1.0
+                im = torch.from_numpy(im).to(model.device)
+                im = im.half() if model.fp16 else im.float()
+                if len(im.shape) == 3:
+                    im = im[None]  # expand for batch dim
 
-        # Process detections
-        for det in pred:
-            seen += 1
-            detections = []
+            # Inference
+            with dt[1]:
+                pred = model(im, augment=augment)
 
-            # Create annotator for visualization
-            annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
+            # NMS
+            with dt[2]:
+                pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-            if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+            # Process detections
+            for det in pred:
+                seen += 1
+                detections = []
 
-                for *xyxy, conf, cls in det:
-                    detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), int(cls)])
+                # Create annotator for visualization
+                annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
 
-                    # Add box to visualization
-                    if save_viz and annotator is not None:
-                        c = int(cls)
-                        label = f"{names[c]} {conf:.2f}"
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                if len(det):
+                    # Rescale boxes from img_size to im0 size
+                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
-            # Save results to original directory (or test directory in test mode)
-            img_name = Path(img_path).stem
-            if output_format == "json":
-                output_path = os.path.join(output_dir, f"{img_name}_det.json")
-                save_detections_json(detections, output_path, names, Path(img_path).name)
-            else:  # txt format
-                output_path = os.path.join(output_dir, f"{img_name}_det.txt")
-                save_detections_txt(detections, output_path, names)
+                    for *xyxy, conf, cls in det:
+                        detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), int(cls)])
 
-            # Save visualization image (to separate directory to avoid modifying original)
-            if save_viz and annotator is not None:
-                viz_img = annotator.result()
-                viz_path = str(viz_save_dir / f"{img_name}_viz.jpg")
-                cv2.imwrite(viz_path, viz_img)
-                LOGGER.info(f"{img_path}: {len(detections)} detection(s) -> {output_path}, viz: {viz_path}")
-            else:
-                n_det = len(detections)
-                LOGGER.info(f"{img_path}: {n_det} detection{'s' * (n_det != 1)} -> {output_path}")
+                        # Add box to visualization
+                        if save_viz and annotator is not None:
+                            c = int(cls)
+                            label = f"{names[c]} {conf:.2f}"
+                            annotator.box_label(xyxy, label, color=colors(c, True))
+
+                # Store detection results grouped by cam_id
+                grouped_detections[cam_id] = {
+                    "image": Path(img_path).name,
+                    "detections": detections,
+                }
+
+                # Save visualization image (organized by folder name)
+                if save_viz and annotator is not None:
+                    viz_img = annotator.result()
+                    img_name = Path(img_path).stem
+                    viz_path = str(viz_folder_dir / f"{img_name}_viz.jpg")
+                    cv2.imwrite(viz_path, viz_img)
+                    LOGGER.info(f"  cam_{cam_id}: {len(detections)} detection(s), viz: {viz_path}")
+                else:
+                    LOGGER.info(f"  cam_{cam_id}: {len(detections)} detection(s)")
+
+        # Save grouped detection results to single file per directory
+        if grouped_detections:
+            if output_format in ("json", "both"):
+                output_path_json = os.path.join(dir_path, "detections.json")
+                save_grouped_detections_json(grouped_detections, output_path_json, names)
+                LOGGER.info(f"Saved grouped detections to: {output_path_json}")
+
+            if output_format in ("txt", "both"):
+                output_path_txt = os.path.join(dir_path, "detections.txt")
+                save_grouped_detections_txt(grouped_detections, output_path_txt, names)
+                LOGGER.info(f"Saved grouped detections to: {output_path_txt}")
 
     # Print results
     t = tuple(x.t / seen * 1e3 if seen else 0 for x in dt)  # speeds per image
     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
 
     if save_viz:
-        LOGGER.info(f"Detection results saved. Visualizations saved to: {viz_save_dir}")
+        LOGGER.info(f"Detection results saved. Visualizations organized by folder in: {viz_save_dir}")
     else:
         LOGGER.info(f"Results saved to original directories. Processed {seen} images.")
 
@@ -382,11 +478,15 @@ def parse_opt():
     parser.add_argument(
         "--cam-pattern",
         type=str,
-        default=r"cam_?08.*\.jpg",
-        help="regex pattern to match camera image filenames (default: cam08xxx.jpg or cam_08xxx.jpg)",
+        default=r"camera_?(0[5-9]).*\.jpg",
+        help="regex pattern to match camera image filenames (default: camera05-09xxx.jpg or camera_05-09xxx.jpg)",
     )
     parser.add_argument(
-        "--output-format", type=str, default="json", choices=["txt", "json"], help="output format for detection results"
+        "--output-format",
+        type=str,
+        default="json",
+        choices=["txt", "json", "both"],
+        help="output format for detection results (txt, json, or both)",
     )
     parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
@@ -399,7 +499,7 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     # Visualization and test mode options
-    parser.add_argument("--save-viz", action="store_true", help="save visualization images with bounding boxes")
+    parser.add_argument("--save-viz", action="store_true", help="save visualization images organized by folder name")
     parser.add_argument(
         "--viz-dir", type=str, default=str(ROOT / "runs/detect_cam"), help="directory for visualization output"
     )
