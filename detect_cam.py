@@ -3,7 +3,11 @@
 Run YOLOv5 detection on camera images from directories listed in a txt file.
 
 Supports multiple camera IDs (05, 06, 07, 08, 09) with naming format:
-- camera{cam_id}xxx.jpg or camera_{cam_id}xxx.jpg
+- camera05xxx.jpg, camera06xxx.jpg, ..., camera09xxx.jpg
+- camera_05xxx.jpg, camera_06xxx.jpg, ..., camera_09xxx.jpg
+
+Each folder can contain up to 5 camera images. Detection results are grouped by
+cam_id and saved to a single JSON/TXT file per folder.
 
 Usage:
     $ python detect_cam.py --weights yolov5s.pt --source paths.txt --path-prefix /data/images
@@ -21,7 +25,7 @@ Arguments:
     --source: txt file where each line is a directory path containing images
     --path-prefix: prefix to add to relative paths in the source txt file
     --output-format: 'txt', 'json', or 'both' for saving detection results
-    --cam-pattern: regex pattern to match camera image names (default matches camera05-09xxx.jpg)
+    --cam-pattern: regex pattern with capturing group for cam_id (default matches camera05-09xxx.jpg)
     --save-viz: save visualization images with bounding boxes
     --viz-dir: directory to save visualization images (organized by folder name)
     --test-mode: run in test mode using sample images
@@ -106,8 +110,12 @@ def get_cam_images(directories, path_prefix="", cam_pattern=r"camera_?(0[5-9]).*
                 if match:
                     # Check if it's a valid image format
                     if file_path.suffix[1:].lower() in IMG_FORMATS:
-                        # Extract cam_id from the match group
-                        cam_id = match.group(1) if match.groups() else "unknown"
+                        # Extract cam_id from the match group (pattern must have one capturing group)
+                        try:
+                            cam_id = match.group(1)
+                        except IndexError:
+                            LOGGER.warning(f"Camera pattern must contain a capturing group for cam_id: {cam_pattern}")
+                            cam_id = "unknown"
                         images.append((str(file_path), cam_id))
 
         if images:
@@ -438,9 +446,9 @@ def run(
                     img_name = Path(img_path).stem
                     viz_path = str(viz_folder_dir / f"{img_name}_viz.jpg")
                     cv2.imwrite(viz_path, viz_img)
-                    LOGGER.info(f"  cam_{cam_id}: {len(detections)} detection(s), viz: {viz_path}")
+                    LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s), viz: {viz_path}")
                 else:
-                    LOGGER.info(f"  cam_{cam_id}: {len(detections)} detection(s)")
+                    LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s)")
 
         # Save grouped detection results to single file per directory
         if grouped_detections:
@@ -479,7 +487,7 @@ def parse_opt():
         "--cam-pattern",
         type=str,
         default=r"camera_?(0[5-9]).*\.jpg",
-        help="regex pattern to match camera image filenames (default: camera05-09xxx.jpg or camera_05-09xxx.jpg)",
+        help="regex pattern with capturing group for cam_id (default: camera{05,06,07,08,09}xxx.jpg)",
     )
     parser.add_argument(
         "--output-format",
