@@ -28,13 +28,13 @@ if str(ROOT) not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.common import DetectMultiBackend
-from utils.dataloaders import IMG_FORMATS, LoadImages
+from utils.augmentations import letterbox
+from utils.dataloaders import IMG_FORMATS
 from utils.general import (
     LOGGER,
     Profile,
     check_img_size,
     check_requirements,
-    colorstr,
     cv2,
     non_max_suppression,
     print_args,
@@ -216,8 +216,6 @@ def run(
 
         # Preprocess
         with dt[0]:
-            from utils.augmentations import letterbox
-
             im = letterbox(im0, imgsz, stride=stride, auto=pt)[0]
             im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
             im = im.astype("float32") / 255.0  # 0-255 to 0.0-1.0
