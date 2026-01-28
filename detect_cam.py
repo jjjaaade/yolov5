@@ -159,30 +159,44 @@ def setup_test_mode():
 
     Returns:
         tuple: (test_dir, paths_file) - temporary directory and paths.txt file for testing
+
+    Raises:
+        FileNotFoundError: If no sample images are found
     """
     test_dir = tempfile.mkdtemp(prefix="detect_cam_test_")
     test_subdir = os.path.join(test_dir, "test_images")
     os.makedirs(test_subdir, exist_ok=True)
 
-    # Copy sample images with cam pattern names
+    # Copy sample images with cam pattern names (both with underscore for consistency)
     sample_images = [
         ROOT / "data/images/bus.jpg",
         ROOT / "data/images/zidane.jpg",
     ]
 
-    cam_names = ["cam08001.jpg", "cam_08002.jpg"]
+    cam_names = ["cam_08001.jpg", "cam_08002.jpg"]
 
+    copied_count = 0
     for src, cam_name in zip(sample_images, cam_names):
         src_path = Path(src).resolve()
         if src_path.exists():
             dst = os.path.join(test_subdir, cam_name)
             shutil.copy(str(src_path), dst)
             LOGGER.info(f"Test mode: copied {src_path.name} -> {cam_name}")
+            copied_count += 1
+        else:
+            LOGGER.warning(f"Test mode: sample image not found: {src_path}")
+
+    if copied_count == 0:
+        shutil.rmtree(test_dir)
+        raise FileNotFoundError(f"No sample images found in {ROOT / 'data/images'}. Cannot run test mode.")
 
     # Create paths.txt
     paths_file = os.path.join(test_dir, "paths.txt")
     with open(paths_file, "w") as f:
         f.write(test_subdir + "\n")
+
+    LOGGER.info(f"Test mode: temporary directory created at {test_dir}")
+    LOGGER.info(f"Test mode: to clean up manually, run: rm -rf {test_dir}")
 
     return test_dir, paths_file
 
@@ -206,7 +220,7 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     save_viz=False,  # save visualization images
-    viz_dir=ROOT / "runs/detect_cam",  # directory for visualization output
+    viz_dir="runs/detect_cam",  # directory for visualization output
     test_mode=False,  # run in test mode with sample images
     line_thickness=3,  # bounding box line thickness
 ):
@@ -353,9 +367,9 @@ def run(
     else:
         LOGGER.info(f"Results saved to original directories. Processed {seen} images.")
 
-    # Cleanup test mode temporary directory
+    # Note about test mode temporary directory
     if test_cleanup_dir and os.path.exists(test_cleanup_dir):
-        LOGGER.info(f"Test mode: keeping temporary directory for inspection: {test_cleanup_dir}")
+        LOGGER.info(f"Test mode: to clean up, run: rm -rf {test_cleanup_dir}")
 
 
 def parse_opt():
@@ -387,7 +401,7 @@ def parse_opt():
     # Visualization and test mode options
     parser.add_argument("--save-viz", action="store_true", help="save visualization images with bounding boxes")
     parser.add_argument(
-        "--viz-dir", type=str, default=ROOT / "runs/detect_cam", help="directory for visualization output"
+        "--viz-dir", type=str, default=str(ROOT / "runs/detect_cam"), help="directory for visualization output"
     )
     parser.add_argument("--test-mode", action="store_true", help="run in test mode with sample images")
     parser.add_argument("--line-thickness", type=int, default=3, help="bounding box line thickness for visualization")
