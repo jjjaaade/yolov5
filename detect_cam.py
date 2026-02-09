@@ -88,6 +88,8 @@ from utils.torch_utils import select_device, smart_inference_mode
 
 
 # COCO class names for reference (80 classes)
+# This constant is provided for user reference when using --classes filter
+# Example: --classes 0 2 9 11  (person, car, traffic light, stop sign)
 COCO_CLASSES = {
     0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
     5: "bus", 6: "train", 7: "truck", 8: "boat", 9: "traffic light",
@@ -459,7 +461,9 @@ def run(
             if device:
                 model.to(device)
             names = model.names
-            stride = 32  # default stride for ultralytics models
+            # Stride is 32 for all standard YOLO models (used for image size validation)
+            # ultralytics handles image preprocessing internally, so this is only for logging
+            stride = 32
         except ImportError:
             LOGGER.error("ultralytics package not found. Install with: pip install ultralytics")
             raise
@@ -477,9 +481,10 @@ def run(
     LOGGER.info(f"Available classes: {class_preview}...")
 
     seen = 0
-    dt = (Profile(device=device if not use_ultralytics else torch.device('cpu')),
-          Profile(device=device if not use_ultralytics else torch.device('cpu')),
-          Profile(device=device if not use_ultralytics else torch.device('cpu')))
+    # Profile objects for timing (only used with YOLOv5 backend)
+    # ultralytics handles its own profiling internally
+    profile_device = device if not use_ultralytics else torch.device('cpu')
+    dt = (Profile(device=profile_device), Profile(device=profile_device), Profile(device=profile_device))
 
     # Process each directory
     for dir_path, images in dir_images.items():
@@ -496,11 +501,20 @@ def run(
         for img_path, cam_id in images:
             seen += 1
 
+            # Validate image exists before processing
+            if not os.path.isfile(img_path):
+                LOGGER.warning(f"Image not found: {img_path}")
+                continue
+
             if use_ultralytics:
                 # Use ultralytics YOLO inference
-                im0, detections, names = run_ultralytics_inference(
-                    model, img_path, conf_thres, iou_thres, classes, max_det
-                )
+                try:
+                    im0, detections, names = run_ultralytics_inference(
+                        model, img_path, conf_thres, iou_thres, classes, max_det
+                    )
+                except Exception as e:
+                    LOGGER.warning(f"Failed to process image {img_path}: {e}")
+                    continue
 
                 # Create annotator for visualization
                 annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
