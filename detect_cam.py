@@ -1,6 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-Run YOLOv5 detection on camera images from directories listed in a txt file.
+Run YOLO detection on camera images from directories listed in a txt file.
+
+Supports multiple YOLO versions:
+- YOLOv5: Using DetectMultiBackend (default)
+- YOLO11/YOLOv8/etc: Using ultralytics YOLO class (--use-ultralytics flag)
 
 Supports multiple camera IDs (05, 06, 07, 08, 09) with naming format:
 - camera05xxx.jpg, camera06xxx.jpg, ..., camera09xxx.jpg
@@ -9,8 +13,17 @@ Supports multiple camera IDs (05, 06, 07, 08, 09) with naming format:
 Each folder can contain up to 5 camera images. Detection results are grouped by
 cam_id and saved to a single JSON/TXT file per folder.
 
+Detection Categories (COCO80):
+- Vehicles: car(2), motorcycle(3), bus(5), truck(7), bicycle(1)
+- Pedestrians: person(0)
+- Traffic: traffic light(9), stop sign(11)
+- And 70+ more classes...
+
 Usage:
     $ python detect_cam.py --weights yolov5s.pt --source paths.txt --path-prefix /data/images
+
+    # Use YOLO11 or YOLOv8 models (via ultralytics)
+    $ python detect_cam.py --weights yolo11n.pt --source paths.txt --use-ultralytics
 
     # Save both JSON and TXT results
     $ python detect_cam.py --source paths.txt --output-format both
@@ -18,16 +31,22 @@ Usage:
     # With visualization (saves annotated images organized by folder name/timestamp)
     $ python detect_cam.py --source paths.txt --save-viz --viz-dir runs/detect_cam
 
+    # Filter specific classes (e.g., person=0, car=2, traffic light=9, stop sign=11)
+    $ python detect_cam.py --source paths.txt --classes 0 2 9 11
+
     # Test mode (uses sample images for validation)
     $ python detect_cam.py --test-mode --save-viz --viz-dir runs/test_viz
 
 Arguments:
+    --weights: model weights path (e.g., yolov5s.pt, yolo11n.pt, yolov8n.pt)
     --source: txt file where each line is a directory path containing images
     --path-prefix: prefix to add to relative paths in the source txt file
     --output-format: 'txt', 'json', or 'both' for saving detection results
     --cam-pattern: regex pattern with capturing group for cam_id (default matches camera05-09xxx.jpg)
     --save-viz: save visualization images with bounding boxes
     --viz-dir: directory to save visualization images (organized by folder name)
+    --use-ultralytics: use ultralytics YOLO class for newer models (YOLO11, YOLOv8, etc.)
+    --classes: filter by class indices (e.g., --classes 0 2 9 11 for person, car, traffic light, stop sign)
     --test-mode: run in test mode using sample images
 """
 
@@ -40,6 +59,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 
 FILE = Path(__file__).resolve()
@@ -65,6 +85,28 @@ from utils.general import (
     scale_boxes,
 )
 from utils.torch_utils import select_device, smart_inference_mode
+
+
+# COCO class names for reference (80 classes)
+COCO_CLASSES = {
+    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
+    5: "bus", 6: "train", 7: "truck", 8: "boat", 9: "traffic light",
+    10: "fire hydrant", 11: "stop sign", 12: "parking meter", 13: "bench",
+    14: "bird", 15: "cat", 16: "dog", 17: "horse", 18: "sheep", 19: "cow",
+    20: "elephant", 21: "bear", 22: "zebra", 23: "giraffe", 24: "backpack",
+    25: "umbrella", 26: "handbag", 27: "tie", 28: "suitcase", 29: "frisbee",
+    30: "skis", 31: "snowboard", 32: "sports ball", 33: "kite", 34: "baseball bat",
+    35: "baseball glove", 36: "skateboard", 37: "surfboard", 38: "tennis racket",
+    39: "bottle", 40: "wine glass", 41: "cup", 42: "fork", 43: "knife",
+    44: "spoon", 45: "bowl", 46: "banana", 47: "apple", 48: "sandwich",
+    49: "orange", 50: "broccoli", 51: "carrot", 52: "hot dog", 53: "pizza",
+    54: "donut", 55: "cake", 56: "chair", 57: "couch", 58: "potted plant",
+    59: "bed", 60: "dining table", 61: "toilet", 62: "tv", 63: "laptop",
+    64: "mouse", 65: "remote", 66: "keyboard", 67: "cell phone", 68: "microwave",
+    69: "oven", 70: "toaster", 71: "sink", 72: "refrigerator", 73: "book",
+    74: "clock", 75: "vase", 76: "scissors", 77: "teddy bear", 78: "hair drier",
+    79: "toothbrush"
+}
 
 
 def get_cam_images(directories, path_prefix="", cam_pattern=r"camera_?(0[5-9]).*\.jpg"):
@@ -283,6 +325,42 @@ def setup_test_mode():
     return test_dir, paths_file
 
 
+def run_ultralytics_inference(model, img_path, conf_thres, iou_thres, classes, max_det):
+    """
+    Run inference using ultralytics YOLO model (supports YOLO11, YOLOv8, etc.).
+
+    Args:
+        model: ultralytics YOLO model instance
+        img_path: path to image
+        conf_thres: confidence threshold
+        iou_thres: IOU threshold for NMS
+        classes: filter by class indices
+        max_det: maximum detections
+
+    Returns:
+        tuple: (im0, detections, names) where detections is list of [x1,y1,x2,y2,conf,cls]
+    """
+    results = model(img_path, conf=conf_thres, iou=iou_thres, classes=classes, max_det=max_det, verbose=False)
+    result = results[0]
+
+    # Get original image
+    im0 = result.orig_img
+
+    # Get class names
+    names = result.names
+
+    # Extract detections
+    detections = []
+    if result.boxes is not None and len(result.boxes):
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            cls = int(box.cls[0].cpu().numpy())
+            detections.append([float(x1), float(y1), float(x2), float(y2), conf, cls])
+
+    return im0, detections, names
+
+
 @smart_inference_mode()
 def run(
     weights=ROOT / "yolov5s.pt",  # model path
@@ -305,12 +383,15 @@ def run(
     viz_dir="runs/detect_cam",  # directory for visualization output
     test_mode=False,  # run in test mode with sample images
     line_thickness=3,  # bounding box line thickness
+    use_ultralytics=False,  # use ultralytics YOLO for newer models (YOLO11, YOLOv8)
 ):
     """
-    Run YOLOv5 detection on camera images from directories listed in a txt file.
+    Run YOLO detection on camera images from directories listed in a txt file.
+
+    Supports both YOLOv5 (DetectMultiBackend) and newer models (YOLO11, YOLOv8) via ultralytics.
 
     Args:
-        weights: Path to model weights file
+        weights: Path to model weights file (e.g., yolov5s.pt, yolo11n.pt, yolov8n.pt)
         source: Path to txt file containing directory paths (one per line)
         data: Path to dataset yaml file
         path_prefix: Prefix to add to relative paths in source file
@@ -321,7 +402,7 @@ def run(
         iou_thres: IOU threshold for NMS
         max_det: Maximum detections per image
         device: CUDA device or 'cpu'
-        classes: Filter by class indices
+        classes: Filter by class indices (e.g., [0,2,9,11] for person, car, traffic light, stop sign)
         agnostic_nms: Class-agnostic NMS
         augment: Augmented inference
         half: FP16 half-precision inference
@@ -330,6 +411,7 @@ def run(
         viz_dir: Directory to save visualization images
         test_mode: Run in test mode using sample images
         line_thickness: Bounding box line thickness for visualization
+        use_ultralytics: Use ultralytics YOLO class for newer models (YOLO11, YOLOv8, etc.)
     """
     test_cleanup_dir = None
 
@@ -364,17 +446,40 @@ def run(
     total_images = sum(len(images) for images in dir_images.values())
     LOGGER.info(f"Found {total_images} camera images in {len(dir_images)} directories to process")
 
-    # Load model
-    device = select_device(device)
-    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-    stride, names, pt = model.stride, model.names, model.pt
-    imgsz = check_img_size(imgsz, s=stride)
+    # Load model based on backend choice
+    # Handle weights as list or string
+    weights_path = weights[0] if isinstance(weights, list) else weights
 
-    # Warmup
-    model.warmup(imgsz=(1 if pt or model.triton else 1, 3, *imgsz))
+    if use_ultralytics:
+        # Use ultralytics YOLO class for newer models (YOLO11, YOLOv8, etc.)
+        try:
+            from ultralytics import YOLO
+            LOGGER.info(f"Loading model with ultralytics YOLO (supports YOLO11, YOLOv8, etc.): {weights_path}")
+            model = YOLO(str(weights_path))
+            if device:
+                model.to(device)
+            names = model.names
+            stride = 32  # default stride for ultralytics models
+        except ImportError:
+            LOGGER.error("ultralytics package not found. Install with: pip install ultralytics")
+            raise
+    else:
+        # Use YOLOv5 DetectMultiBackend
+        device = select_device(device)
+        model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
+        stride, names, pt = model.stride, model.names, model.pt
+        imgsz = check_img_size(imgsz, s=stride)
+        # Warmup
+        model.warmup(imgsz=(1 if pt or model.triton else 1, 3, *imgsz))
+
+    LOGGER.info(f"Model loaded with {len(names)} classes")
+    class_preview = ', '.join([f'{k}:{v}' for k, v in list(names.items())[:20]])
+    LOGGER.info(f"Available classes: {class_preview}...")
 
     seen = 0
-    dt = (Profile(device=device), Profile(device=device), Profile(device=device))
+    dt = (Profile(device=device if not use_ultralytics else torch.device('cpu')),
+          Profile(device=device if not use_ultralytics else torch.device('cpu')),
+          Profile(device=device if not use_ultralytics else torch.device('cpu')))
 
     # Process each directory
     for dir_path, images in dir_images.items():
@@ -389,66 +494,82 @@ def run(
 
         # Process each image in this directory
         for img_path, cam_id in images:
-            # Load image
-            im0 = cv2.imread(img_path)
-            if im0 is None:
-                LOGGER.warning(f"Image not found or cannot be read: {img_path}")
-                continue
+            seen += 1
 
-            # Preprocess
-            with dt[0]:
-                im = letterbox(im0, imgsz, stride=stride, auto=pt)[0]
-                im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-                im = im.astype("float32") / 255.0  # 0-255 to 0.0-1.0
-                im = torch.from_numpy(im).to(model.device)
-                im = im.half() if model.fp16 else im.float()
-                if len(im.shape) == 3:
-                    im = im[None]  # expand for batch dim
-
-            # Inference
-            with dt[1]:
-                pred = model(im, augment=augment)
-
-            # NMS
-            with dt[2]:
-                pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
-            # Process detections
-            for det in pred:
-                seen += 1
-                detections = []
+            if use_ultralytics:
+                # Use ultralytics YOLO inference
+                im0, detections, names = run_ultralytics_inference(
+                    model, img_path, conf_thres, iou_thres, classes, max_det
+                )
 
                 # Create annotator for visualization
                 annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
 
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                if save_viz and annotator is not None and detections:
+                    for det in detections:
+                        x1, y1, x2, y2, conf, cls = det
+                        c = int(cls)
+                        label = f"{names[c]} {conf:.2f}"
+                        annotator.box_label([x1, y1, x2, y2], label, color=colors(c, True))
+            else:
+                # Use YOLOv5 DetectMultiBackend inference
+                # Load image
+                im0 = cv2.imread(img_path)
+                if im0 is None:
+                    LOGGER.warning(f"Image not found or cannot be read: {img_path}")
+                    continue
 
-                    for *xyxy, conf, cls in det:
-                        detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), int(cls)])
+                # Preprocess
+                with dt[0]:
+                    im = letterbox(im0, imgsz, stride=stride, auto=pt)[0]
+                    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                    im = im.astype("float32") / 255.0  # 0-255 to 0.0-1.0
+                    im = torch.from_numpy(im).to(model.device)
+                    im = im.half() if model.fp16 else im.float()
+                    if len(im.shape) == 3:
+                        im = im[None]  # expand for batch dim
 
-                        # Add box to visualization
-                        if save_viz and annotator is not None:
-                            c = int(cls)
-                            label = f"{names[c]} {conf:.2f}"
-                            annotator.box_label(xyxy, label, color=colors(c, True))
+                # Inference
+                with dt[1]:
+                    pred = model(im, augment=augment)
 
-                # Store detection results grouped by cam_id
-                grouped_detections[cam_id] = {
-                    "image": Path(img_path).name,
-                    "detections": detections,
-                }
+                # NMS
+                with dt[2]:
+                    pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-                # Save visualization image (organized by folder name)
-                if save_viz and annotator is not None:
-                    viz_img = annotator.result()
-                    img_name = Path(img_path).stem
-                    viz_path = str(viz_folder_dir / f"{img_name}_viz.jpg")
-                    cv2.imwrite(viz_path, viz_img)
-                    LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s), viz: {viz_path}")
-                else:
-                    LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s)")
+                # Process detections
+                detections = []
+                annotator = Annotator(im0.copy(), line_width=line_thickness, example=str(names)) if save_viz else None
+
+                for det in pred:
+                    if len(det):
+                        # Rescale boxes from img_size to im0 size
+                        det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+
+                        for *xyxy, conf, cls in det:
+                            detections.append([float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), int(cls)])
+
+                            # Add box to visualization
+                            if save_viz and annotator is not None:
+                                c = int(cls)
+                                label = f"{names[c]} {conf:.2f}"
+                                annotator.box_label(xyxy, label, color=colors(c, True))
+
+            # Store detection results grouped by cam_id
+            grouped_detections[cam_id] = {
+                "image": Path(img_path).name,
+                "detections": detections,
+            }
+
+            # Save visualization image (organized by folder name)
+            if save_viz and annotator is not None:
+                viz_img = annotator.result()
+                img_name = Path(img_path).stem
+                viz_path = str(viz_folder_dir / f"{img_name}_viz.jpg")
+                cv2.imwrite(viz_path, viz_img)
+                LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s), viz: {viz_path}")
+            else:
+                LOGGER.info(f"  camera_{cam_id}: {len(detections)} detection(s)")
 
         # Save grouped detection results to single file per directory
         if grouped_detections:
@@ -463,8 +584,9 @@ def run(
                 LOGGER.info(f"Saved grouped detections to: {output_path_txt}")
 
     # Print results
-    t = tuple(x.t / seen * 1e3 if seen else 0 for x in dt)  # speeds per image
-    LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
+    if not use_ultralytics:
+        t = tuple(x.t / seen * 1e3 if seen else 0 for x in dt)  # speeds per image
+        LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
 
     if save_viz:
         LOGGER.info(f"Detection results saved. Visualizations organized by folder in: {viz_save_dir}")
@@ -477,9 +599,14 @@ def run(
 
 
 def parse_opt():
-    """Parse command-line arguments for YOLOv5 camera image detection."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path")
+    """Parse command-line arguments for YOLO camera image detection."""
+    parser = argparse.ArgumentParser(
+        description="Run YOLO detection on camera images. Supports YOLOv5, YOLOv8, YOLO11, etc."
+    )
+    parser.add_argument(
+        "--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt",
+        help="model weights path (e.g., yolov5s.pt, yolo11n.pt, yolov8n.pt)"
+    )
     parser.add_argument("--source", type=str, default=ROOT / "paths.txt", help="txt file with directory paths")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
     parser.add_argument("--path-prefix", type=str, default="", help="prefix for relative paths in source file")
@@ -501,7 +628,10 @@ def parse_opt():
     parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument("--classes", nargs="+", type=int, help="filter by class: --classes 0, or --classes 0 2 3")
+    parser.add_argument(
+        "--classes", nargs="+", type=int,
+        help="filter by class: --classes 0 2 9 11 (person, car, traffic light, stop sign)"
+    )
     parser.add_argument("--agnostic-nms", action="store_true", help="class-agnostic NMS")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
@@ -513,6 +643,11 @@ def parse_opt():
     )
     parser.add_argument("--test-mode", action="store_true", help="run in test mode with sample images")
     parser.add_argument("--line-thickness", type=int, default=3, help="bounding box line thickness for visualization")
+    # New model backend option
+    parser.add_argument(
+        "--use-ultralytics", action="store_true",
+        help="use ultralytics YOLO class for newer models (YOLO11, YOLOv8, etc.)"
+    )
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
@@ -520,7 +655,7 @@ def parse_opt():
 
 
 def main(opt):
-    """Execute YOLOv5 camera image detection based on command-line arguments."""
+    """Execute YOLO camera image detection based on command-line arguments."""
     check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
     run(**vars(opt))
 
